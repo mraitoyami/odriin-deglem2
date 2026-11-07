@@ -1,0 +1,20 @@
+{
+  "name": "odriin-deglem-51",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Өдрийн дэглэм · 51 дүгээр сургууль (HTML, CSS, JavaScript + Supabase)",
+  "scripts": {
+    "config": "node scripts/build-config.mjs",
+    "start": "node scripts/build-config.mjs && npx --yes serve@14.2.4 public",
+    "build": "node scripts/build-config.mjs",
+    "admin": "node scripts/admin.mjs",
+    "test": "node tests/app.test.mjs",
+    "test:rls": "node supabase/tests/rls.test.mjs"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.2.17",
+    "@supabase/supabase-js": "2.45.4",
+    "jsdom": "25.0.1"
+  }
+}
