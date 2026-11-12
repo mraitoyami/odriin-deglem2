@@ -84,7 +84,8 @@
   const state = { phase: "boot", user: null, notice: "", loadError: "" };
 
   function emptyDb() {
-    return { students: [], tasks: [], task_logs: [], schedule: [], daily_logs: [], teacher_notes: [], day_goals: [], rewards: [], transactions: [], points: {} };
+    return { students: [], tasks: [], task_logs: [], schedule: [], daily_logs: [], teacher_notes: [], day_goals: [], rewards: [], transactions: [], points: {},
+      parent_tasks: [], parent_responses: [], parents: [], parentFeature: true };
   }
   let db = emptyDb();
 
@@ -108,8 +109,30 @@
   }
 
   /** Хэрэглэгчийн харах эрхтэй бүх өгөгдлийг ачаална. RLS нь зөвхөн зөвшөөрөгдсөн мөрийг буцаана. */
+  // Даалгаврын төлөв өөрчлөх бүрт нэмэгдэнэ. Ачаалал эхэлснээс хойш өөрчлөлт хийгдсэн бол
+  // хуучин хариугаар шинэ төлөвийг дарахгүй (check/uncheck буцаж харагдах алдаанаас сэргийлнэ).
+  let taskSeq = 0;
+  const pointsSeq = {};
+  const isMissingRelation = (e) => ["42P01", "42883", "PGRST200", "PGRST202", "PGRST205"].includes(e && e.code)
+    || /does not exist|schema cache|Could not find/i.test(String((e && e.message) || ""));
+
+  /** 14_parent_tasks.sql ажиллаагүй database дээр сайтын бусад хэсэг хэвийн ажиллана */
+  async function loadParentData() {
+    try {
+      const [tasks, resp] = await Promise.all([
+        must(sb.from("parent_tasks").select("id, student_id, parent_id, title, description, due_date, active, created_at").order("created_at", { ascending: false })),
+        must(sb.from("parent_task_responses").select("task_id, parent_id, done, comment, done_at, updated_at")),
+      ]);
+      const parents = state.user && state.user.role === "teacher" ? await must(sb.rpc("teacher_parents")) : [];
+      return { ok: true, tasks, resp, parents: parents || [] };
+    } catch (e) {
+      if (isMissingRelation(e)) return { ok: false, tasks: [], resp: [], parents: [] };
+      throw e;
+    }
+  }
+
   async function loadData() {
-    const t = today(), from = addDays(t, -HISTORY_DAYS), to = addDays(t, 1);
+    const t = today(), from = addDays(t, -HISTORY_DAYS), to = addDays(t, 1), seq = taskSeq;
     const [profiles, sps, tasks, comps, sched, logs, notes, goals, rewards, txs] = await Promise.all([
       must(sb.from("profiles").select("id, full_name").eq("role", "student")),
       must(sb.from("student_profiles").select("student_id, class_name, goal_pct, screen_limit_min")),
@@ -134,12 +157,22 @@
     next.day_goals = goals;
     next.rewards = rewards;
     next.transactions = txs;
+    const par = await loadParentData();
+    next.parentFeature = par.ok; next.parent_tasks = par.tasks; next.parent_responses = par.resp; next.parents = par.parents;
     // Оноог сервер бүх түүхээс тооцно
     const sums = await Promise.all(next.students.map((s) => must(sb.rpc("points_summary", { sid: s.id }))));
     next.students.forEach((s, i) => { next.points[s.id] = sums[i]; });
+    if (seq !== taskSeq || ui.pending.size) {
+      // Ачааллын явцад даалгаврын төлөв өөрчлөгдсөн: тэр өөрчлөлтийг хадгалж, хуучин хариуг хэрэглэхгүй
+      next.task_logs = db.task_logs; next.points = { ...next.points, ...db.points };
+    }
     db = next;
   }
-  async function refreshPoints(sid) { db.points[sid] = await must(sb.rpc("points_summary", { sid })); }
+  async function refreshPoints(sid) {
+    const mine = (pointsSeq[sid] = (pointsSeq[sid] || 0) + 1);
+    const p = await must(sb.rpc("points_summary", { sid }));
+    if (pointsSeq[sid] === mine) db.points[sid] = p;   // сүүлийн хүсэлтийн хариуг л хэрэглэнэ
+  }
 
   const myStudents = () => db.students.slice().sort((a, b) => a.full_name.localeCompare(b.full_name));
   const getStudent = (id) => db.students.find((s) => s.id === id) || null;
@@ -176,7 +209,14 @@
           .select("task_id, student_id, log_date, status, points").single(), { rows: true });
         db.task_logs = db.task_logs.filter((l) => !(l.task_id === taskId && l.log_date === date)).concat(row);
       } else {
-        await must(sb.from("task_completions").delete().eq("task_id", taskId).eq("log_date", date).select("task_id"));
+        const del = await must(sb.from("task_completions").delete().eq("task_id", taskId).eq("log_date", date).select("task_id"));
+        if (!del || !del.length) {
+          // 0 мөр устсан: мөр үнэхээр байхгүй бол зүгээр, байгаа бол сервер татгалзсан — амжилттай мэт харуулахгүй
+          const still = await must(sb.from("task_completions").select("task_id").eq("task_id", taskId).eq("log_date", date));
+          if (still && still.length) throw Object.assign(new Error(isEditable(date)
+            ? "Хадгалагдсангүй: энэ даалгаврыг буцаах эрх хүрэлцэхгүй байна."
+            : "Энэ өдрийн бүртгэлийг засах хугацаа (7 хоног) дууссан тул буцаах боломжгүй."), { code: "P0001" });
+        }
         db.task_logs = db.task_logs.filter((l) => !(l.task_id === taskId && l.log_date === date));
       }
       await refreshPoints(sid);
@@ -205,6 +245,27 @@
     deleteNote: (id) => must(sb.from("teacher_notes").delete().eq("id", id).select("id"), { rows: true }),
     saveSettings: (sid, v) => must(sb.from("student_profiles").update(v).eq("student_id", sid).select("student_id"), { rows: true }),
     saveTheme: (uid, theme) => must(sb.from("user_settings").upsert({ user_id: uid, theme }, { onConflict: "user_id" }).select("user_id")),
+    /** Нэг ч удаа тэмдэглэгдээгүй даалгаврыг л устгана (сервер шалгана). Түүхтэй бол түр зогсооно. */
+    async deleteTask(id) {
+      const r = await must(sb.from("tasks").delete().eq("id", id).select("id"));
+      if (!r || !r.length) throw Object.assign(new Error("Энэ даалгаврыг сурагч тэмдэглэж байсан тул устгах боломжгүй. Оноо, түүх хадгалагдахын тулд «Түр зогсоох»-ыг ашиглана уу."), { code: "P0001" });
+    },
+    /* ---- Эцэг эхийн даалгавар (сурагчийн даалгавраас тусдаа) ---- */
+    createParentTask: (row) => must(sb.from("parent_tasks").insert(row).select("id").single(), { rows: true }),
+    updateParentTask: (id, v) => must(sb.from("parent_tasks").update(v).eq("id", id).select("id"), { rows: true }),
+    async deleteParentTask(id) {
+      const r = await must(sb.from("parent_tasks").delete().eq("id", id).select("id"));
+      if (!r || !r.length) throw Object.assign(new Error("Эцэг эх биелүүлсэн даалгаврыг устгах боломжгүй. «Архивлах»-ыг ашиглана уу."), { code: "P0001" });
+    },
+    /** Эцэг эхийн хариу: байхгүй бол нэмнэ, байвал шинэчилнэ (нэг даалгаварт нэг мөр) */
+    async saveParentResponse(taskId, v, exists = db.parent_responses.some((r) => r.task_id === taskId)) {
+      if (!exists) {
+        const { error } = await sb.from("parent_task_responses").insert({ task_id: taskId, ...v }).select("task_id").single();
+        if (!error) return;
+        if (error.code !== "23505") throw error;   // өөр төхөөрөмжөөс зэрэг үүссэн бол шинэчилнэ
+      }
+      await must(sb.from("parent_task_responses").update(v).eq("task_id", taskId).select("task_id"), { rows: true });
+    },
   };
 
   /* ================= 5. НЭВТРЭЛТ ================= */
@@ -368,7 +429,7 @@
   /* ---- UI төлөв (хадгалагдахгүй) ---- */
   const ui = {
     loginRole: null, loginId: "", loginPw: "", loginError: "", loginBusy: false, showPw: false,
-    open: {}, drafts: {}, status: {}, errors: {}, editing: null, pickReward: null, schedule: null, pending: new Set(),
+    open: {}, drafts: {}, status: {}, errors: {}, editing: null, pickReward: null, schedule: null, pending: new Set(), confirm: null,
   };
   const draft = (key, fallback) => (key in ui.drafts ? ui.drafts[key] : fallback);
   const clearDrafts = (prefix) => { for (const k of Object.keys(ui.drafts)) if (k.startsWith(prefix)) delete ui.drafts[k]; };
@@ -476,12 +537,12 @@
   /* ---------- Shell ---------- */
   const NAV = {
     student: [["/s", "Өнөөдөр", "sun"], ["/s/rewards", "Шагнал", "gift"], ["/s/schedule", "Хуваарь", "calendar"], ["/s/history", "Түүх", "history"]],
-    teacher: [["/t", "Сурагчид", "users"]],
-    guardian: [["/p", "Өнөөдөр", "sun"], ["/p/week", "Долоо хоног", "clipboard"]],
+    teacher: [["/t", "Сурагчид", "users"], ["/t/parents", "Эцэг эх", "heart"]],
+    guardian: [["/p", "Өнөөдөр", "sun"], ["/p/tasks", "Миний даалгавар", "checkCircle"], ["/p/week", "Долоо хоног", "clipboard"]],
   };
   function shell(user, path, content) {
     const items = NAV[user.role];
-    const active = (to) => (to === path || (to !== ROLES[user.role].home && path.startsWith(to)) || (path.startsWith("/s/day/") && to === "/s/history") || (path.startsWith("/t/") && to === "/t"));
+    const active = (to) => (to === path || (to !== ROLES[user.role].home && path.startsWith(to)) || (path.startsWith("/s/day/") && to === "/s/history") || (path.startsWith("/t/student/") && to === "/t"));
     const links = (cls) => items.map(([to, label, ic]) =>
       `<a href="#${to}" ${active(to) ? 'aria-current="page"' : ""}>${cls === "bottom" ? `<span class="pill-icon">${icon(ic)}</span>` : icon(ic)}${label}</a>`).join("");
     return `
@@ -728,15 +789,15 @@
   }
   function weekTable(s) {
     const t = today();
-    return `<div class="table-wrap"><table>
+    return `<div class="table-wrap"><table class="cardify">
       <thead><tr><th>Өдөр</th><th>Биелэлт</th><th class="right">Дэлгэц</th><th class="right">Хөдөлгөөн</th><th class="right">Унтсан</th></tr></thead>
       <tbody>${lastDays(7, t).reverse().map((d) => {
         const p = progress(s.id, d), h = dailyLog(s.id, d), over = h && h.screen_minutes != null && h.screen_minutes > s.screen_limit_min;
-        return `<tr><td>${d === t ? "Өнөөдөр" : formatShort(d)}</td>
-          <td><div class="mini-bar">${progressBar(p.pct, d + " биелэлт")}<span class="num muted small">${p.pct}%</span></div></td>
-          <td class="right num${over ? " warn-text strong" : ""}">${fmtMinutes(h ? h.screen_minutes : null)}</td>
-          <td class="right num">${h && h.movement_minutes != null ? h.movement_minutes + " мин" : "—"}</td>
-          <td class="right num">${h && h.bed_time ? h.bed_time : "—"}</td></tr>`;
+        return `<tr><td class="day-cell">${d === t ? "Өнөөдөр" : formatShort(d)}</td>
+          <td data-label="Биелэлт"><div class="mini-bar">${progressBar(p.pct, d + " биелэлт")}<span class="num muted small">${p.pct}%</span></div></td>
+          <td data-label="Дэлгэц" class="right num${over ? " warn-text strong" : ""}">${fmtMinutes(h ? h.screen_minutes : null)}</td>
+          <td data-label="Хөдөлгөөн" class="right num">${h && h.movement_minutes != null ? h.movement_minutes + " мин" : "—"}</td>
+          <td data-label="Унтсан" class="right num">${h && h.bed_time ? h.bed_time : "—"}</td></tr>`;
       }).join("")}</tbody></table></div>`;
   }
   function dailySummary(s, date) {
@@ -757,16 +818,30 @@
   }
 
   /* ---------- Багш: сурагчдын жагсаалт ---------- */
+  /** Сүүлийн 7 хоногийн өдөр бүрийн биелэлт (жижиг багана) */
+  function miniWeek(s) {
+    const t = today();
+    return `<div class="mini-week" role="img" aria-label="Сүүлийн 7 хоногийн биелэлт">${lastDays(7, t).map((d) => {
+      const p = progress(s.id, d), x = parseDate(d);
+      return `<span class="mw-day" title="${formatShort(d)}: ${p.total ? p.pct + "%" : "—"}">
+        <span class="mw-bar"><span style="height:${p.total ? Math.max(p.pct, 4) : 0}%"${p.help ? ' class="help"' : ""}></span></span>
+        <span class="mw-lbl${d === t ? " strong" : ""}">${WEEKDAYS_SHORT[x.getUTCDay()]}</span></span>`;
+    }).join("")}</div>`;
+  }
   function viewTeacherHome() {
     const t = today(), list = myStudents();
-    return `${pageHead("Хариуцсан сурагчид", formatLong(t), "Өнөөдрийн биелэлт. Дэлгэрэнгүйг сурагч дээр дарж харна.")}
+    return `${pageHead("Хариуцсан сурагчид", formatLong(t), "Өнөөдрийн биелэлт, оноо, сүүлийн 7 хоног. Дэлгэрэнгүйг сурагч дээр дарж харна.")}
     <section class="card">${list.length ? `<ul class="list">${list.map((s) => {
-      const p = progress(s.id, t);
-      return `<li><a class="list-row" href="#/t/student/${s.id}">
+      const p = progress(s.id, t), pts = points(s.id).balance, kids = db.parents.filter((x) => x.student_id === s.id).length;
+      return `<li><a class="list-row student-row" href="#/t/student/${s.id}">
         <div class="grow">
-          <div class="row between" style="align-items:baseline"><p class="strong">${esc(s.full_name)} <span class="muted small" style="font-weight:400">${esc(s.class_name || "")}</span></p>
-            <p class="num muted small">${p.total ? `${p.pct}% · ${p.done}/${p.total}` : "Даалгаваргүй"}${p.help ? ` <span class="status help">${p.help} дэмжлэг</span>` : ""}</p></div>
-          <div style="margin-top:8px">${progressBar(p.pct, s.full_name + " ахиц")}</div>
+          <div class="row between" style="align-items:baseline;gap:4px 12px">
+            <p class="strong">${esc(s.full_name)} <span class="muted small" style="font-weight:400">${esc(s.class_name || "")}</span></p>
+            <p class="num small"><span class="tag">${pts} оноо</span></p>
+          </div>
+          <p class="num muted small" style="margin-top:4px">Өнөөдөр: ${p.total ? `${p.pct}% · ${p.done}/${p.total} хийсэн` : "Даалгаваргүй"}${p.help ? ` <span class="status help">${p.help} дэмжлэг</span>` : ""}${db.parentFeature ? ` · эцэг эх ${kids}` : ""}</p>
+          <div style="margin-top:8px">${progressBar(p.pct, s.full_name + " өнөөдрийн ахиц")}</div>
+          ${p.total || tasksOf(s.id).length ? miniWeek(s) : ""}
         </div>${icon("chevRight")}</a></li>`;
     }).join("")}</ul>` : empty("Танд хариуцуулсан сурагч алга", "Сургуулийн админ таны аккаунтыг сурагчтай холбосны дараа энд харагдана.")}</section>`;
   }
@@ -810,7 +885,19 @@
           : '<p class="muted" style="padding:8px 20px 20px;font-size:15px">Дэмжлэг хүссэн даалгавар алга.</p>'}</section>
       <section class="card"><div class="card-head"><div><h2>Долоо хоног</h2><p>Дэлгэц, хөдөлгөөнийг сурагч эсвэл эцэг эх гараар оруулна</p></div></div><div class="card-body">${weekTable(s)}</div></section>
       <section class="card"><div class="card-head"><div><h2>Өдрийн бүртгэл</h2><p>${formatLong(t)}</p></div></div><div style="margin-top:4px">${dailySummary(s, t)}</div></section>
+      ${db.parentFeature ? parentsCard(s) : ""}
     </div>`;
+  }
+  function parentsCard(s) {
+    const ps = db.parents.filter((x) => x.student_id === s.id);
+    return `<section class="card"><div class="card-head"><div><h2>Эцэг эх / асран хамгаалагч</h2><p>${ps.length ? "Тэдэнд өгсөн даалгаврыг «Эцэг эх» хэсгээс удирдана" : "Холбогдоогүй"}</p></div>
+        <a class="btn btn-secondary btn-sm" href="#/t/parents?c=${s.id}">Эцэг эх</a></div>
+      ${ps.length ? `<ul class="list card-body">${ps.map((x) => {
+        const tk = db.parent_tasks.filter((t) => t.parent_id === x.parent_id && t.student_id === s.id && t.active);
+        const dn = tk.filter((t) => parentResp(t.id)?.done).length;
+        return `<li class="list-row"><div class="grow"><p class="strong">${esc(x.full_name)}</p><p class="muted small wrap-any">${esc(x.email || "")}</p></div>
+          <span class="num muted small">${tk.length ? `${dn}/${tk.length} биелсэн` : "Даалгаваргүй"}</span></li>`;
+      }).join("")}</ul>` : '<p class="muted" style="padding:8px 20px 20px;font-size:15px">Энэ сурагчид эцэг эхийн бүртгэл холбогдоогүй байна. Сургуулийн админ холбоно.</p>'}</section>`;
   }
 
   function taskForm(s, task) {
@@ -836,7 +923,7 @@
     const all = tasksOf(s.id, true);
     if (!all.length && ui.editing !== "task:new") return seedCard(s);
     return `<div class="stack">
-      <div class="row between"><p class="muted" style="font-size:15px">Хасах оронд «Түр зогсоох» ашиглана. Өмнөх бүртгэл хадгалагдана.</p>
+      <div class="row between"><p class="muted" style="font-size:15px">Тэмдэглэгдэж байсан даалгаврыг устгахгүй, «Түр зогсоох»-ыг ашиглана. Өмнөх бүртгэл, оноо хадгалагдана.</p>
         <button type="button" class="btn btn-primary btn-sm" data-action="edit" data-key="task:new">${icon("plus", "sm")}Даалгавар нэмэх</button></div>
       ${ui.status.taskToggle && ui.status.taskToggle.ok === false ? errorAlert(ui.status.taskToggle.text) : ""}
       ${ui.editing === "task:new" ? `<section class="card card-pad">${taskForm(s, null)}</section>` : ""}
@@ -845,11 +932,12 @@
         if (!items.length) return "";
         return `<section class="card"><div class="card-head"><div><h2>${c.label}</h2><p>${items.filter((t) => t.active).length} идэвхтэй</p></div></div>
           <ul class="list card-body">${items.map((t) => `<li>${ui.editing === "task:" + t.id ? `<div class="card-pad">${taskForm(s, t)}</div>` : `
-            <div class="list-row"${t.active ? "" : ' style="opacity:.6"'}>
+            <div class="list-row admin-row"${t.active ? "" : ' style="opacity:.6"'}>
               <div class="grow"><p class="strong">${esc(t.title)}${t.active ? "" : ' <span class="muted small" style="font-weight:400">· түр зогссон</span>'}</p>
                 <p class="muted small">${SLOTS[t.slot]}${t.minutes ? ` · ${t.minutes} мин` : ""} · ${t.points} оноо</p></div>
               <button type="button" class="icon-btn" id="ed-${t.id}" data-action="edit" data-key="task:${t.id}" aria-label="${esc(t.title)} засах">${icon("pencil", "sm")}</button>
               <button type="button" class="btn btn-ghost btn-sm" data-action="toggle-task" data-id="${t.id}" ${dis("taskToggle")}>${t.active ? "Түр зогсоох" : "Сэргээх"}</button>
+              <button type="button" class="icon-btn danger" id="del-${t.id}" data-action="ask-delete-task" data-id="${t.id}" aria-label="${esc(t.title)} устгах" ${dis("taskToggle")}>${icon("trash", "sm")}</button>
             </div>`}</li>`).join("")}</ul></section>`;
       }).join("")}
     </div>`;
@@ -917,7 +1005,7 @@
           ${ui.status.rewardToggle && ui.status.rewardToggle.ok === false ? `<div style="padding:12px 20px">${errorAlert(ui.status.rewardToggle.text)}</div>` : ""}
           ${ui.editing === "reward:new" ? `<div class="card-pad" style="border-bottom:1px solid var(--line)">${rewardForm(s, null)}</div>` : ""}
           <ul class="list">${list.map((r) => `<li>${ui.editing === "reward:" + r.id ? `<div class="card-pad">${rewardForm(s, r)}</div>` : `
-            <div class="list-row"${r.active ? "" : ' style="opacity:.6"'}>
+            <div class="list-row admin-row"${r.active ? "" : ' style="opacity:.6"'}>
               <span class="reward-icon small">${icon(r.icon)}</span>
               <div class="grow"><p class="strong">${esc(r.title)}${r.active ? "" : ' <span class="muted small" style="font-weight:400">· нуусан</span>'}</p><p class="num muted small">${r.cost} оноо</p></div>
               <button type="button" class="icon-btn" id="er-${r.id}" data-action="edit" data-key="reward:${r.id}" aria-label="${esc(r.title)} засах">${icon("pencil", "sm")}</button>
@@ -992,8 +1080,11 @@
     const p = progress(child.id, date), goal = dayGoal(child.id, date), snote = studentNote(child.id, date);
     const notes = db.teacher_notes.filter((n) => n.student_id === child.id && n.share_with_parent).slice(0, 5);
     const q = (d) => `#/p?c=${child.id}${d ? "&d=y" : ""}`;
+    const myTasks = db.parent_tasks.filter((x) => x.parent_id === state.user.id && x.student_id === child.id && x.active);
+    const open = myTasks.filter((x) => !parentResp(x.id)?.done).length;
     return `${childPicker(kids, child, "/p")}
     <div class="stack">
+      ${myTasks.length ? `<a class="points-link" style="margin-top:0" href="#/p/tasks?c=${child.id}"><span>${open ? `Багшаас танд өгсөн <b>${open}</b> даалгавар хүлээгдэж байна` : "Багшаас өгсөн даалгавраа бүгдийг биелүүлсэн"}</span><span class="go">Харах${icon("chevRight", "sm")}</span></a>` : ""}
       <header class="page-head" style="margin:0"><p class="eyebrow">${esc(child.full_name)}</p><h1>${date === t ? "Өнөөдрийн бүртгэл" : formatLong(date)}</h1>
         <div class="row" style="margin-top:10px">
           <a class="pill-btn outlined" href="${q(false)}" aria-pressed="${date === t}">Өнөөдөр</a>
@@ -1028,6 +1119,121 @@
         ${obs.length ? `<ul class="list card-body">${obs.map((h) => `<li style="padding:12px 20px;font-size:15px"><span class="muted">${formatShort(h.log_date)} · ${(MOODS.find((m) => m[0] === h.mood) || [0, "—"])[1]}</span>${h.sleep_note ? `<p>${esc(h.sleep_note)}</p>` : ""}</li>`).join("")}</ul>`
           : '<p class="muted" style="padding:8px 20px 20px;font-size:15px">Энэ долоо хоногт ажиглалт бичигдээгүй байна.</p>'}</section>
     </div>`;
+  }
+
+  /* ---------- Эцэг эхийн даалгавар (сурагчийн даалгавраас тусдаа) ---------- */
+  const parentResp = (taskId) => db.parent_responses.find((r) => r.task_id === taskId) || null;
+  const dateOfTsLocal = (ts) => (ts ? new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ts)) : "");
+  function dueLabel(t, done) {
+    if (!t.due_date) return "";
+    const over = !done && t.due_date < today();
+    return `<span class="${over ? "warn-text strong" : "muted"}">${over ? "Хугацаа хэтэрсэн · " : "Хугацаа: "}${formatShort(t.due_date)}</span>`;
+  }
+  function parentTaskForm(sid, pid, task) {
+    const k = task ? task.id : `new:${sid}:${pid}`, e = ui.errors["pt:" + k] || {};
+    const v = (name, fb) => esc(draft(`pf:${k}:${name}`, fb));
+    const d = task || { title: "", description: "", due_date: "" };
+    return `<form class="form" data-form="ptask" data-id="${task ? task.id : ""}" data-sid="${sid}" data-pid="${pid}" novalidate>
+      <div class="row between"><h3 style="font-size:16px">${task ? "Даалгавар засах" : "Эцэг эхэд даалгавар өгөх"}</h3>
+        <button type="button" class="icon-btn" data-action="cancel-edit" aria-label="Болих">${icon("x")}</button></div>
+      ${field("Даалгавар", `pf-title-${k}`, `<input class="input" id="pf-title-${k}" name="title" data-draft="pf:${k}:title" maxlength="120" placeholder="Жишээ нь: Унтахын өмнө 10 минут хамт ном унших" value="${v("title", d.title)}" ${e.title ? 'aria-invalid="true"' : ""}>`, { error: e.title })}
+      ${field("Тайлбар, зөвлөмж", `pf-desc-${k}`, `<textarea class="input" id="pf-desc-${k}" name="description" data-draft="pf:${k}:description" maxlength="500" placeholder="Яаж хийх, юуг анхаарах">${v("description", d.description)}</textarea>`)}
+      ${field("Хугацаа (заавал биш)", `pf-due-${k}`, `<input class="input" id="pf-due-${k}" name="due" type="date" data-draft="pf:${k}:due" value="${v("due", d.due_date || "")}" ${e.due ? 'aria-invalid="true"' : ""}>`, { error: e.due })}
+      ${ui.status.ptEdit && ui.status.ptEdit.ok === false ? errorAlert(ui.status.ptEdit.text) : ""}
+      <div class="form-foot end"><button type="button" class="btn btn-secondary" data-action="cancel-edit">Болих</button>
+        <button type="submit" class="btn btn-primary" ${dis("ptEdit")}>${task ? "Хадгалах" : "Даалгавар өгөх"}</button></div>
+    </form>`;
+  }
+  function parentTaskRow(t) {
+    const r = parentResp(t.id), done = !!(r && r.done);
+    if (ui.editing === "pt:" + t.id) return `<li><div class="card-pad">${parentTaskForm(t.student_id, t.parent_id, t)}</div></li>`;
+    return `<li class="ptask${t.active ? "" : " archived"}">
+      <div class="ptask-main">
+        <p class="strong">${esc(t.title)}${t.active ? "" : ' <span class="muted small" style="font-weight:400">· архивласан</span>'}</p>
+        ${t.description ? `<p class="muted small" style="white-space:pre-wrap;margin-top:2px">${esc(t.description)}</p>` : ""}
+        <p class="small" style="margin-top:6px">${done ? `<span class="status done">Биелсэн · ${formatShort(dateOfTsLocal(r.done_at))}</span>` : '<span class="status none">Хүлээгдэж байна</span>'} ${dueLabel(t, done)}</p>
+        ${r && r.comment ? `<p class="note-box" style="margin-top:8px"><span class="muted">Эцэг эхийн тайлбар: </span>${esc(r.comment)}</p>` : ""}
+      </div>
+      <div class="ptask-actions">
+        <button type="button" class="icon-btn" id="pted-${t.id}" data-action="edit" data-key="pt:${t.id}" aria-label="${esc(t.title)} засах">${icon("pencil", "sm")}</button>
+        <button type="button" class="btn btn-ghost btn-sm" data-action="pt-archive" data-id="${t.id}" ${dis("ptToggle")}>${t.active ? "Архивлах" : "Сэргээх"}</button>
+        ${done ? "" : `<button type="button" class="icon-btn danger" id="ptdel-${t.id}" data-action="ask-delete-ptask" data-id="${t.id}" aria-label="${esc(t.title)} устгах">${icon("trash", "sm")}</button>`}
+      </div>
+    </li>`;
+  }
+  function viewTeacherParents(params) {
+    const head = pageHead("Эцэг эх / асран хамгаалагч", "", "Хариуцсан сурагчдын эцэг эх. Тэдэнд зөвлөмж, хийх зүйл өгч, биелэлтийг шалгана. Сурагчийн даалгавраас тусдаа.");
+    if (!db.parentFeature) return head + `<div class="card">${empty("Эцэг эхийн хэсэг идэвхжээгүй байна",
+      "Supabase → SQL Editor-т <code>supabase/setup/14_parent_tasks.sql</code>-ийг ажиллуулсны дараа энд харагдана. Одоо байгаа өгөгдөлд нөлөөлөхгүй.")}</div>`;
+    const all = myStudents(), only = all.find((x) => x.id === params.get("c"));
+    const list = only ? [only] : all;
+    const msg = ui.status.ptToggle && ui.status.ptToggle.ok === false ? errorAlert(ui.status.ptToggle.text) : "";
+    if (!all.length) return head + `<div class="card">${empty("Танд хариуцуулсан сурагч алга")}</div>`;
+    return `${head}
+      ${all.length > 1 ? `<div class="pills" role="tablist" aria-label="Сурагч шүүх">
+        <a class="pill-btn outlined" href="#/t/parents" aria-pressed="${!only}">Бүгд</a>
+        ${all.map((x) => `<a class="pill-btn outlined" href="#/t/parents?c=${x.id}" aria-pressed="${only && only.id === x.id}">${esc(x.full_name)}</a>`).join("")}</div>` : ""}
+      <div class="stack">${msg}${list.map((st) => {
+        const ps = db.parents.filter((x) => x.student_id === st.id);
+        return `<section class="card">
+          <div class="card-head"><div><h2>${esc(st.full_name)}</h2><p>${esc(st.class_name || "Сурагч")} · ${ps.length ? `${ps.length} эцэг эх` : "эцэг эх холбогдоогүй"}</p></div></div>
+          ${ps.length ? ps.map((x) => {
+            const tasks = db.parent_tasks.filter((t) => t.parent_id === x.parent_id && t.student_id === st.id)
+              .sort((a, b) => (b.active - a.active) || String(b.created_at).localeCompare(String(a.created_at)));
+            const act = tasks.filter((t) => t.active), dn = act.filter((t) => parentResp(t.id)?.done).length;
+            const key = `pt:new:${st.id}:${x.parent_id}`;
+            return `<div class="parent-block">
+              <div class="row between" style="align-items:flex-start">
+                <div class="grow"><p class="strong">${esc(x.full_name)}</p>
+                  <p class="muted small wrap-any">${x.email ? `<a href="mailto:${esc(x.email)}">${esc(x.email)}</a>` : "и-мэйлгүй"} · ${esc(st.full_name)}-ийн эцэг эх</p>
+                  <p class="muted small num" style="margin-top:2px">${act.length ? `${dn}/${act.length} даалгавар биелсэн` : "Даалгавар өгөөгүй"}</p></div>
+                ${ui.editing === key ? "" : `<button type="button" class="btn btn-secondary btn-sm" data-action="edit" data-key="${key}">${icon("plus", "sm")}Даалгавар өгөх</button>`}
+              </div>
+              ${ui.editing === key ? `<div style="margin-top:16px">${parentTaskForm(st.id, x.parent_id, null)}</div>` : ""}
+              ${tasks.length ? `<ul class="list ptasks">${tasks.map(parentTaskRow).join("")}</ul>` : ""}
+            </div>`;
+          }).join("") : '<p class="muted" style="padding:8px 20px 20px;font-size:15px">Энэ сурагчид эцэг эхийн бүртгэл холбогдоогүй байна. Сургуулийн админ холбоно.</p>'}
+        </section>`;
+      }).join("")}</div>`;
+  }
+  function viewParentTasks(params) {
+    const kids = myStudents(), child = kids.find((k) => k.id === params.get("c")) || kids[0];
+    if (!child) return noChild();
+    const mine = db.parent_tasks.filter((t) => t.parent_id === state.user.id && t.student_id === child.id && t.active)
+      .sort((a, b) => (!!parentResp(a.id)?.done - !!parentResp(b.id)?.done) || String(a.due_date || "9").localeCompare(String(b.due_date || "9")));
+    const st = ui.status.presp;
+    return `${childPicker(kids, child, "/p/tasks")}${pageHead("Багшаас өгсөн даалгавар", child.full_name, "Танд зориулсан зөвлөмж, хийх зүйл. Хүүхдийн даалгавраас тусдаа бөгөөд оноо өгөхгүй.")}
+    <div class="stack">
+      ${st && st.ok === false ? errorAlert(st.text) : ""}
+      ${mine.length ? mine.map((t) => {
+        const r = parentResp(t.id), done = !!(r && r.done), k = `pr:${t.id}`;
+        return `<section class="card card-pad ptask-card${done ? " is-done" : ""}">
+          <div class="row" style="align-items:flex-start;flex-wrap:nowrap;gap:12px">
+            <button type="button" class="check" id="pchk-${t.id}" data-action="presp-toggle" data-id="${t.id}" aria-pressed="${done}" aria-label="${esc(t.title)}: ${done ? "биелээгүй болгох" : "биелсэн гэж тэмдэглэх"}" ${ui.pending.has(t.id) ? "disabled" : ""}>${icon("check")}</button>
+            <div class="grow"><h2 style="font-size:16px;font-weight:500">${esc(t.title)}</h2>
+              ${t.description ? `<p class="muted small" style="white-space:pre-wrap;margin-top:4px">${esc(t.description)}</p>` : ""}
+              <p class="small" style="margin-top:6px">${done ? `<span class="status done">Биелсэн · ${formatShort(dateOfTsLocal(r.done_at))}</span>` : '<span class="status none">Хүлээгдэж байна</span>'} ${dueLabel(t, done)}</p></div>
+          </div>
+          <form class="form" data-form="presp" data-id="${t.id}" style="margin-top:16px" novalidate>
+            ${field("Тайлбар (заавал биш)", `pc-${t.id}`, `<textarea class="input" id="pc-${t.id}" name="comment" data-draft="${k}" maxlength="500" placeholder="Юу хийсэн, хүүхэд хэрхэн оролцсон">${esc(draft(k, r ? r.comment : ""))}</textarea>`)}
+            <div class="form-foot">${saveStatus(k)}<button type="submit" class="btn btn-primary btn-sm" ${dis(k)}>Тайлбар хадгалах</button></div>
+          </form>
+        </section>`;
+      }).join("") : `<div class="card">${empty("Одоогоор даалгавар алга", "Багш танд зөвлөмж, хийх зүйл өгөхөд энд харагдана.")}</div>`}
+    </div>`;
+  }
+
+  /* ---------- Устгахыг баталгаажуулах цонх ---------- */
+  function confirmDialog() {
+    const c = ui.confirm;
+    if (!c) return "";
+    return `<div class="scrim" data-action="close-confirm" data-self="1">
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-h">
+        <h2 id="dlg-h">${esc(c.title)}</h2><p>${esc(c.text)}</p>
+        ${ui.status.confirm && ui.status.confirm.ok === false ? `<div style="margin-top:12px">${errorAlert(ui.status.confirm.text)}</div>` : ""}
+        <div class="row"><button type="button" class="btn btn-secondary btn-sm" data-action="close-confirm" id="dlg-cancel" ${dis("confirm")}>Болих</button>
+          ${ui.status.confirm && ui.status.confirm.ok === false ? "" : `<button type="button" class="btn btn-danger btn-sm" data-action="do-confirm" ${dis("confirm")}>${busy("confirm") ? '<span class="spinner sm" aria-hidden="true"></span>' : ""}Устгах</button>`}</div>
+      </div></div>`;
   }
 
   /* ================= 9. ЧИГЛҮҮЛЭЛТ БА EVENT ================= */
@@ -1072,11 +1278,11 @@
           : viewStudentDay(m && m[1] <= today() ? m[1] : today());
       } else if (user.role === "teacher") {
         const m = path.match(/^\/t\/student\/([\w-]+)$/);
-        content = m ? viewTeacherStudent(m[1], params.get("tab") || "overview") : viewTeacherHome();
+        content = m ? viewTeacherStudent(m[1], params.get("tab") || "overview") : path === "/t/parents" ? viewTeacherParents(params) : viewTeacherHome();
       } else {
-        content = path === "/p/week" ? viewParentWeek(params) : viewParentToday(params);
+        content = path === "/p/week" ? viewParentWeek(params) : path === "/p/tasks" ? viewParentTasks(params) : viewParentToday(params);
       }
-      app.innerHTML = shell(user, path, content);
+      app.innerHTML = shell(user, path, content + confirmDialog());
     }
     if (focusedId) { const el = document.getElementById(focusedId); if (el) el.focus({ preventScroll: true }); }
     const dlg = app.querySelector(".dialog");
@@ -1085,7 +1291,7 @@
 
   window.addEventListener("hashchange", () => {
     captureDrafts();
-    ui.status = {}; ui.errors = {}; ui.editing = null; ui.pickReward = null;
+    ui.status = {}; ui.errors = {}; ui.editing = null; ui.pickReward = null; ui.confirm = null;
     if (!location.hash.includes("tab=schedule")) ui.schedule = null;
     render();
     try { window.scrollTo(0, 0); } catch (e) { /* ignore */ }
@@ -1113,7 +1319,7 @@
         const status = el.dataset.status || null, before = db.task_logs.slice(), beforePts = db.points[sid];
         db.task_logs = db.task_logs.filter((l) => !(l.task_id === id && l.log_date === date));
         if (status) db.task_logs.push({ task_id: id, student_id: sid, log_date: date, status, points: 0 });
-        ui.pending.add(id); delete ui.status.task; render();
+        ui.pending.add(id); taskSeq++; delete ui.status.task; render();
         try { await api.setTask(sid, id, date, status); }
         catch (e) { db.task_logs = before; db.points[sid] = beforePts; ui.status.task = { ok: false, text: friendlyError(e) }; }
         ui.pending.delete(id); render();
@@ -1132,7 +1338,7 @@
 
       case "tab": { const { path } = route(); location.hash = `#${path}?tab=${el.dataset.tab}`; break; }
       case "edit": ui.editing = el.dataset.key; ui.errors = {}; delete ui.status.taskEdit; delete ui.status.rewardEdit; render(); break;
-      case "cancel-edit": clearDrafts("tf:"); clearDrafts("rf:"); ui.editing = null; ui.errors = {}; render(); break;
+      case "cancel-edit": clearDrafts("tf:"); clearDrafts("rf:"); clearDrafts("pf:"); ui.editing = null; ui.errors = {}; render(); break;
       case "seed": await run("seed", () => api.seedPlan(id)); ui.schedule = null; render(); break;
       case "toggle-task": { const t = db.tasks.find((x) => x.id === id); await run("taskToggle", () => api.updateTask(id, { active: !t.active })); break; }
       case "toggle-reward": { const r = db.rewards.find((x) => x.id === id); await run("rewardToggle", () => api.updateReward(id, { active: !r.active })); break; }
@@ -1146,6 +1352,33 @@
         if (!id.startsWith("new-")) ui.schedule.removed.push(id);
         delete ui.status.schedule; render(); break;
       case "del-note": await run("tnote", () => api.deleteNote(id)); break;
+
+      case "ask-delete-task": {
+        const t = db.tasks.find((x) => x.id === id);
+        ui.confirm = { kind: "task", id, title: "Даалгавар устгах уу?", text: `«${t ? t.title : ""}» даалгаврыг бүр мөсөн устгана. Сурагч тэмдэглэж байсан даалгаврыг устгах боломжгүй (оноо, түүх хадгалагдана) — тэр үед «Түр зогсоох»-ыг ашиглана уу.` };
+        delete ui.status.confirm; render(); break;
+      }
+      case "ask-delete-ptask": {
+        const t = db.parent_tasks.find((x) => x.id === id);
+        ui.confirm = { kind: "ptask", id, title: "Эцэг эхийн даалгавар устгах уу?", text: `«${t ? t.title : ""}» даалгаврыг устгана. Биелсэн даалгаврыг устгахгүй, архивлана.` };
+        delete ui.status.confirm; render(); break;
+      }
+      case "close-confirm": if (!busy("confirm")) { ui.confirm = null; delete ui.status.confirm; render(); } break;
+      case "do-confirm": {
+        const c = ui.confirm; if (!c) break;
+        await run("confirm", () => (c.kind === "task" ? api.deleteTask(c.id) : api.deleteParentTask(c.id)), { onOk: () => { ui.confirm = null; } });
+        if (!ui.confirm) delete ui.status.confirm;
+        render(); break;
+      }
+      case "pt-archive": { const t = db.parent_tasks.find((x) => x.id === id); await run("ptToggle", () => api.updateParentTask(id, { active: !t.active })); break; }
+      case "presp-toggle": {
+        const r = parentResp(id), done = !(r && r.done), before = db.parent_responses.slice();
+        db.parent_responses = db.parent_responses.filter((x) => x.task_id !== id).concat({ ...(r || { task_id: id, parent_id: state.user.id, comment: "" }), done, done_at: done ? new Date().toISOString() : null });
+        ui.pending.add(id); delete ui.status.presp; render();
+        try { await api.saveParentResponse(id, { done }, !!r); await loadData(); }
+        catch (e) { db.parent_responses = before; ui.status.presp = { ok: false, text: friendlyError(e) }; }
+        ui.pending.delete(id); render(); break;
+      }
     }
   });
 
@@ -1255,6 +1488,24 @@
         break;
       }
 
+      case "ptask": {
+        const id = f.dataset.id, k = id || `new:${sid}:${f.dataset.pid}`, title = str("title"), due = str("due"), err = {};
+        if (!title) err.title = "Даалгаврыг бичнэ үү.";
+        if (due && !/^\d{4}-\d{2}-\d{2}$/.test(due)) err.due = "Огноог зөв оруулна уу.";
+        ui.errors["pt:" + k] = err;
+        if (Object.keys(err).length) { render(); break; }
+        const v = { title, description: str("description"), due_date: due || null };
+        await run("ptEdit", () => (id ? api.updateParentTask(id, v) : api.createParentTask({ ...v, student_id: sid, parent_id: f.dataset.pid })),
+          { onOk: () => { ui.editing = null; clearDrafts(`pf:${k}:`); } });
+        break;
+      }
+
+      case "presp": {
+        const id = f.dataset.id, k = `pr:${id}`, comment = String(ui.drafts[k] ?? "").trim();
+        await run(k, () => api.saveParentResponse(id, { comment }), { onOk: () => delete ui.drafts[k] });
+        break;
+      }
+
       case "settings": {
         const g = int(fd.get("goal")), l = int(fd.get("limit")), err = {};
         if (g == null || !isInt(g, 10, 100)) err.goal = "10–100 хооронд бүхэл тоо.";
@@ -1267,12 +1518,19 @@
     }
   });
 
+  // Утсан дээр гар (keyboard) гарч ирэхэд идэвхтэй талбар халхлагдахгүй байхаар харагдах хэсэгт гаргана
+  document.addEventListener("focusin", (ev) => {
+    const el = ev.target;
+    if (!el.matches || !el.matches("input:not([type=checkbox]):not([type=radio]), textarea, select") || window.innerWidth >= 1024) return;
+    setTimeout(() => { try { el.scrollIntoView({ block: "center", behavior: "smooth" }); } catch (e) { /* ignore */ } }, 300);
+  });
   document.addEventListener("input", (ev) => {
     if (ev.target.id === "login-id") ui.loginId = ev.target.value;
     if (ev.target.id === "login-pw") ui.loginPw = ev.target.value;
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && ui.pickReward && !busy("reward")) { ui.pickReward = null; render(); }
+    if (ev.key === "Escape" && ui.confirm && !busy("confirm")) { ui.confirm = null; delete ui.status.confirm; render(); }
   });
 
   // Өөр төхөөрөмж дээр хийсэн өөрчлөлтийг харуулахын тулд таб руу буцаж ирэхэд дахин ачаална
