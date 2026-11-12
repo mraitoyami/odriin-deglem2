@@ -408,3 +408,92 @@ dl.facts dd { margin: 0; padding-bottom: 10px; border-bottom: 1px solid var(--li
   *, *::before, *::after { transition: none !important; }
   .spinner { animation-duration: 2.4s; }
 }
+
+/* ---------- Багш: сурагчийн жагсаалт — сүүлийн 7 хоног ---------- */
+.mini-week { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; max-width: 280px; margin-top: 12px; }
+.mw-day { display: grid; justify-items: center; gap: 4px; }
+.mw-bar { display: flex; align-items: flex-end; width: 100%; max-width: 24px; height: 32px; border-radius: 6px; background: var(--sunken); overflow: hidden; }
+.mw-bar > span { display: block; width: 100%; background: var(--accent); }
+.mw-bar > span.help { background: var(--warn); }
+.mw-lbl { font-size: 12px; line-height: 1; color: var(--muted); }
+
+/* ---------- Эцэг эхийн даалгавар ---------- */
+.parent-block { padding: 16px 20px; border-top: 1px solid var(--line); }
+.parent-block:first-of-type { margin-top: 12px; }
+.ptasks { margin-top: 12px; border-radius: var(--radius-ctl); box-shadow: inset 0 0 0 1px var(--line); }
+.ptask { display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; }
+.ptask.archived { opacity: .6; }
+.ptask-main { flex: 1; min-width: 0; }
+.ptask-actions { display: flex; align-items: center; gap: 4px; flex: none; }
+.ptask-card.is-done h2 { color: var(--muted); }
+.wrap-any { overflow-wrap: anywhere; }
+@media (max-width: 519px) {
+  .ptask { flex-direction: column; gap: 4px; }
+  .ptask-actions { align-self: flex-end; }
+}
+
+/* =========================================================
+   Утас ба жижиг дэлгэц
+   ========================================================= */
+html, body { overflow-x: hidden; }                 /* хамгаалалт: ямар ч элемент хэвтээ гүйлгэлт үүсгэхгүй */
+.main { min-width: 0; }
+.stack > *, .grid-2 > *, .grid-3 > *, .layout > * { min-width: 0; }   /* grid/flex-ийн хүүхэд агуулгаасаа өргөсөхгүй */
+.input, select.input { min-width: 0; max-width: 100%; }
+.row > .grow, .list-row > .grow { min-width: 0; }
+.page-head h1, .card-head h2, .strong, .task-title { overflow-wrap: break-word; }
+.card-head > div { min-width: 0; }
+
+/* iPhone-ийн «home indicator», дээд «notch»-д халхлагдахгүй */
+.main { padding-left: max(16px, env(safe-area-inset-left)); padding-right: max(16px, env(safe-area-inset-right)); }
+
+/* Dialog: утасны дэлгэцэнд бүрэн багтана, урт бол дотроо гүйлгэнэ */
+.scrim { grid-template-columns: minmax(0, 384px); justify-content: center; padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom)); overflow-y: auto; }
+.dialog { width: 100%; max-height: calc(100dvh - 32px); overflow-y: auto; overscroll-behavior: contain; }
+.dialog .row { flex-wrap: wrap; }
+
+/* Хүрэлтээр удирдах төхөөрөмж: дарах талбар томорно */
+@media (pointer: coarse), (max-width: 639px) {
+  .check { width: 40px; height: 40px; margin-top: 0; }
+  .opt-btn { min-height: 40px; }
+  .icon-btn { width: 44px; height: 44px; }
+  .btn-sm { min-height: 44px; }
+  .pill-btn { min-height: 44px; }
+  .link-btn { min-height: 44px; }
+}
+
+/* Хүснэгт: 640px-ээс жижиг дэлгэцэд мөр бүр карт болно */
+@media (max-width: 639px) {
+  table.cardify { min-width: 0; }
+  table.cardify thead { display: none; }
+  table.cardify, table.cardify tbody, table.cardify tr, table.cardify td { display: block; width: 100%; }
+  table.cardify tr { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; padding: 14px 20px; border-bottom: 1px solid var(--line); }
+  table.cardify tr:last-child { border-bottom: 0; }
+  table.cardify td { padding: 0; border: 0; white-space: normal; text-align: left; }
+  table.cardify td.day-cell { grid-column: 1 / -1; font-weight: 500; }
+  table.cardify td[data-label]::before { content: attr(data-label); display: block; font-size: 13px; color: var(--muted); }
+  table.cardify td:first-child, table.cardify td:last-child { padding-left: 0; padding-right: 0; }
+  table.cardify .mini-bar .progress { width: 100%; max-width: 120px; }
+  .table-wrap { overflow-x: visible; }
+}
+
+/* Маш нарийн дэлгэц (320px) */
+@media (max-width: 359px) {
+  .main { padding-left: 12px; padding-right: 12px; }
+  .pills { margin-left: -12px; margin-right: -12px; padding-left: 12px; padding-right: 12px; }
+  .card-pad, .list-row, .card-head, .task, .group-toggle, .parent-block, .sched-row { padding-left: 14px; padding-right: 14px; }
+  .balance-num { font-size: 34px; }
+  .bottom-nav a { font-size: 12px; }
+}
+a.pill-btn { display: inline-flex; align-items: center; text-decoration: none; }
+.mw-bar > span.help { background: var(--accent); }
+.parent-block > .row > .grow { flex: 1 1 220px; }
+.topbar .brand { flex: none; }
+.topbar .brand-name { white-space: nowrap; }
+@media (max-width: 419px) { .topbar-role { visibility: hidden; flex: 1; } }
+
+/* Багшийн засах мөр: утсан дээр товчнууд доод мөрөнд, нэр бүтэн өргөнөөрөө */
+@media (max-width: 519px) {
+  .admin-row { flex-wrap: wrap; row-gap: 4px; }
+  .admin-row > .grow { flex: 1 0 100%; }
+  .admin-row > :not(.grow):first-of-type, .admin-row > .grow + * { margin-left: auto; }
+}
